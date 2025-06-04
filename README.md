@@ -26,8 +26,6 @@ docker compose down -v
 
 ## Resources
 
-https://clickhouse.com/docs/operations/storing-data#s3-plain-rewritable-storage
-
-https://github.com/ClickHouse/ClickHouse/issues/70154
-
-https://clickhouse.com/blog/clickhouse-release-25-04#data-lakes-from-mergetree-tables
+- https://clickhouse.com/docs/operations/storing-data#s3-plain-rewritable-storage
+- https://github.com/ClickHouse/ClickHouse/issues/70154
+- https://clickhouse.com/blog/clickhouse-release-25-04#data-lakes-from-mergetree-tables
