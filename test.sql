@@ -63,6 +63,7 @@ DETACH TABLE writer;
 select generateUUIDv4();
 
 -- this comes from the /var/lib/clickhouse/metadata/default/writer.sql but uses the new UUID
+-- the new UUID can be different because the storage is based on the endpoint (which includes the bucket and path)
 ATTACH TABLE writer UUID '2e4d59c4-0547-41a6-a961-1b743cff35d7' (
   id UInt64
 ) ORDER BY ()
