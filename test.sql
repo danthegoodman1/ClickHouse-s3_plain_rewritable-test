@@ -20,8 +20,6 @@ INSERT INTO writer (id) VALUES (2);
 
 select * from writer;
 
-select uuid from system.tables where name = 'writer'; -- need this for <UUID>
-
 
 -- Reader
 CREATE TABLE reader (
