@@ -149,15 +149,19 @@ def _detect_cloud_provider() -> str | None:
     return None
 
 
-def _log_modal_placement_once() -> None:
-    global _placement_logged
-    if _placement_logged:
-        return
-    placement = {
+def _modal_placement_payload() -> dict[str, Any]:
+    return {
         "configured_regions": FUNCTION_REGIONS,
         "runtime_region": _detect_runtime_region() or "unknown",
         "cloud_provider": _detect_cloud_provider() or "unknown",
     }
+
+
+def _log_modal_placement_once() -> None:
+    global _placement_logged
+    if _placement_logged:
+        return
+    placement = _modal_placement_payload()
     payload = json.dumps(placement, sort_keys=True)
     print(f"modal_placement {payload}", flush=True)
     _placement_logged = True
@@ -324,10 +328,16 @@ def _make_asgi_app() -> FastAPI:
             while True:
                 raw_message = await websocket.receive_text()
                 request_id, query_items, was_batch, parse_error = _parse_query_items(raw_message)
+                placement = _modal_placement_payload()
 
                 if parse_error:
                     await websocket.send_json(
-                        {"id": request_id, "ok": False, "error": parse_error}
+                        {
+                            "id": request_id,
+                            "ok": False,
+                            "error": parse_error,
+                            "modal_placement": placement,
+                        }
                     )
                     continue
 
@@ -336,7 +346,13 @@ def _make_asgi_app() -> FastAPI:
                     try:
                         result = _execute_query(query_text, settings=query_settings)
                         await websocket.send_json(
-                            {"id": request_id, "ok": True, "query": query_text, **result}
+                            {
+                                "id": request_id,
+                                "ok": True,
+                                "query": query_text,
+                                "modal_placement": placement,
+                                **result,
+                            }
                         )
                     except Exception as exc:  # noqa: BLE001
                         await websocket.send_json(
@@ -345,6 +361,7 @@ def _make_asgi_app() -> FastAPI:
                                 "ok": False,
                                 "query": query_text,
                                 "error": str(exc),
+                                "modal_placement": placement,
                             }
                         )
                     continue
@@ -366,6 +383,7 @@ def _make_asgi_app() -> FastAPI:
                         "id": request_id,
                         "ok": all_ok,
                         "results": result_items,
+                        "modal_placement": placement,
                     }
                 )
         except WebSocketDisconnect:
