@@ -5,7 +5,7 @@ description = "Add your description here"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "clickhouse-connect",
+    "chdb==3.7.2",
     "fastapi",
     "modal",
     "websockets",

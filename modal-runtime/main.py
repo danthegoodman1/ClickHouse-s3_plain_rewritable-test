@@ -1,168 +1,179 @@
-"""Modal websocket runtime backed by a container-local ClickHouse server."""
+"""Modal websocket runtime backed by chdb (in-process ClickHouse)."""
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import json
+import logging
 import os
-import pwd
-import socket
-import subprocess
-import time
 from datetime import date, datetime, time as datetime_time
 from decimal import Decimal
-from pathlib import Path
 from typing import Any
 from uuid import UUID
 
-import clickhouse_connect
 import modal
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from modal.exception import ClientClosed
+
+
+@contextlib.contextmanager
+def _silence_stderr() -> Any:
+    saved_stderr_fd: int | None = None
+    devnull_fd: int | None = None
+    try:
+        saved_stderr_fd = os.dup(2)
+        devnull_fd = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull_fd, 2)
+        yield
+    finally:
+        if saved_stderr_fd is not None:
+            os.dup2(saved_stderr_fd, 2)
+            os.close(saved_stderr_fd)
+        if devnull_fd is not None:
+            os.close(devnull_fd)
+
+
+with _silence_stderr():
+    from chdb.session import Session
 
 app = modal.App("clickhouse-ws-demo")
+logger = logging.getLogger(__name__)
+FUNCTION_REGIONS = ["us-east"]
 
-CLICKHOUSE_HTTP_PORT = 8123
-CLICKHOUSE_CONFIG_PATH = "/etc/clickhouse-server/config.xml"
-CLICKHOUSE_ASYNC_CONFIG_PATH = "/etc/clickhouse-server/config.d/async-load-databases.xml"
-LOCAL_ASYNC_CONFIG_PATH = Path(__file__).parent / "config" / "async-load-databases.xml"
-CLICKHOUSE_LOG_PATH = Path("/tmp/clickhouse-server.log")
-CLICKHOUSE_ERR_LOG_PATH = Path("/var/log/clickhouse-server/clickhouse-server.err.log")
-CLICKHOUSE_STARTUP_TIMEOUT_S = 120
+
+class _ModalAsyncioShutdownNoiseFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        if (
+            "an error occurred during closing of asynchronous generator" in message
+            and "_ContainerIOManager.get_data_in" in message
+        ):
+            return False
+        if "unhandled exception during asyncio.run() shutdown" not in message:
+            return True
+        if not record.exc_info:
+            return True
+        exception = record.exc_info[1]
+        if isinstance(exception, ClientClosed):
+            return False
+        return exception.__class__.__name__ != "ClientClosed"
+
+
+def _install_asyncio_logger_filter() -> None:
+    asyncio_logger = logging.getLogger("asyncio")
+    if getattr(asyncio_logger, "_modal_shutdown_noise_filter_installed", False):
+        return
+    asyncio_logger.addFilter(_ModalAsyncioShutdownNoiseFilter())
+    setattr(asyncio_logger, "_modal_shutdown_noise_filter_installed", True)
+
+
+_install_asyncio_logger_filter()
+
 
 image = (
-    modal.Image.from_registry("clickhouse/clickhouse-server", add_python="3.12")
-    .pip_install("clickhouse-connect", "fastapi")
-    .run_commands(
-        "mkdir -p /etc/clickhouse-server/config.d /var/lib/clickhouse /var/log/clickhouse-server /var/run/clickhouse-server",
-    )
-    .add_local_file(
-        str(LOCAL_ASYNC_CONFIG_PATH),
-        remote_path=CLICKHOUSE_ASYNC_CONFIG_PATH,
-    )
+    modal.Image.debian_slim(python_version="3.12")
+    .pip_install("chdb", "fastapi")
+    .run_commands("python -c \"import chdb; chdb.query('SELECT 1')\" >/dev/null 2>&1")
 )
 
-_clickhouse_process: subprocess.Popen[str] | None = None
-_clickhouse_client: clickhouse_connect.driver.client.Client | None = None
-_clickhouse_startup_error: str | None = None
+_session: Session | None = None
+_placement_logged = False
 
 
-def _read_log_tail(lines: int = 80) -> str:
-    if not CLICKHOUSE_LOG_PATH.exists():
-        return "No ClickHouse log file found."
-    content = CLICKHOUSE_LOG_PATH.read_text(encoding="utf-8", errors="replace")
-    tail = content.splitlines()[-lines:]
-    return "\n".join(tail) if tail else "ClickHouse log file is empty."
-
-
-def _read_clickhouse_err_log_tail(lines: int = 80) -> str:
-    if not CLICKHOUSE_ERR_LOG_PATH.exists():
-        return "No ClickHouse error log file found."
-    content = CLICKHOUSE_ERR_LOG_PATH.read_text(encoding="utf-8", errors="replace")
-    tail = content.splitlines()[-lines:]
-    return "\n".join(tail) if tail else "ClickHouse error log file is empty."
-
-
-def _startup_diagnostics() -> str:
-    return (
-        "Bootstrap log tail:\n"
-        f"{_read_log_tail()}\n\n"
-        "ClickHouse error log tail:\n"
-        f"{_read_clickhouse_err_log_tail()}"
-    )
-
-
-def _is_tcp_open(host: str, port: int, timeout_s: float = 1.0) -> bool:
-    try:
-        with socket.create_connection((host, port), timeout=timeout_s):
-            return True
-    except OSError:
+def _should_ignore_asyncio_shutdown_exception(context: dict[str, Any]) -> bool:
+    exception = context.get("exception")
+    message = str(context.get("message", ""))
+    if isinstance(exception, ClientClosed):
+        return True
+    if "aclose(): asynchronous generator is already running" not in message:
         return False
+    task = context.get("task")
+    if task is None:
+        return False
+    task_repr = repr(task)
+    return "_ContainerIOManager.get_data_in" in task_repr
 
 
-def _start_clickhouse_server() -> None:
-    global _clickhouse_process, _clickhouse_client
-    if _clickhouse_client is not None:
+def _install_asyncio_exception_filter() -> None:
+    loop = asyncio.get_running_loop()
+    if getattr(loop, "_modal_shutdown_filter_installed", False):
         return
+    previous_handler = loop.get_exception_handler()
 
-    if _clickhouse_process is not None and _clickhouse_process.poll() is not None:
-        _clickhouse_process = None
-
-    if _clickhouse_process is None:
-        clickhouse_user = pwd.getpwnam("clickhouse")
-        log_file = CLICKHOUSE_LOG_PATH.open("a", encoding="utf-8")
-        _clickhouse_process = subprocess.Popen(
-            [
-                "clickhouse-server",
-                f"--config-file={CLICKHOUSE_CONFIG_PATH}",
-            ],
-            stdout=log_file,
-            stderr=subprocess.STDOUT,
-            text=True,
-            user=clickhouse_user.pw_uid,
-            group=clickhouse_user.pw_gid,
-            env={**os.environ, "CLICKHOUSE_WATCHDOG_ENABLE": "0"},
-        )
-        log_file.close()
-
-    deadline = time.monotonic() + CLICKHOUSE_STARTUP_TIMEOUT_S
-    last_error = "unknown startup error"
-    while time.monotonic() < deadline:
-        if _clickhouse_process.poll() is not None:
-            raise RuntimeError(
-                "ClickHouse exited during startup.\n"
-                f"Exit code: {_clickhouse_process.returncode}\n"
-                f"{_startup_diagnostics()}"
-            )
-        try:
-            if not _is_tcp_open("127.0.0.1", CLICKHOUSE_HTTP_PORT, timeout_s=0.5):
-                time.sleep(0.5)
-                continue
-            client = clickhouse_connect.get_client(
-                host="localhost",
-                port=CLICKHOUSE_HTTP_PORT,
-                connect_timeout=1,
-                send_receive_timeout=5,
-            )
-            client.query("SELECT 1")
-            _clickhouse_client = client
+    def _handler(current_loop: asyncio.AbstractEventLoop, context: dict[str, Any]) -> None:
+        if _should_ignore_asyncio_shutdown_exception(context):
             return
-        except Exception as exc:  # noqa: BLE001
-            last_error = str(exc)
-            time.sleep(0.5)
+        if previous_handler is not None:
+            previous_handler(current_loop, context)
+            return
+        current_loop.default_exception_handler(context)
 
-    raise TimeoutError(
-        f"Timed out waiting for ClickHouse HTTP on localhost:{CLICKHOUSE_HTTP_PORT}. "
-        f"Last client error: {last_error}\n"
-        f"{_startup_diagnostics()}"
-    )
+    loop.set_exception_handler(_handler)
+    setattr(loop, "_modal_shutdown_filter_installed", True)
 
 
-def _ensure_clickhouse_server() -> None:
-    global _clickhouse_startup_error
-    if _clickhouse_client is not None:
+def _detect_runtime_region() -> str | None:
+    for key in (
+        "MODAL_REGION",
+        "MODAL_RUNTIME_REGION",
+        "MODAL_FUNCTION_REGION",
+        "AWS_REGION",
+        "AWS_DEFAULT_REGION",
+        "GCP_REGION",
+    ):
+        value = os.environ.get(key)
+        if value:
+            return value
+    return None
+
+
+def _detect_cloud_provider() -> str | None:
+    for key in ("MODAL_CLOUD_PROVIDER", "MODAL_CLOUD", "CLOUD_PROVIDER"):
+        value = os.environ.get(key)
+        if value:
+            upper_value = value.upper()
+            if "AZURE" in upper_value:
+                return "azure"
+            if "AWS" in upper_value:
+                return "aws"
+            if "GCP" in upper_value or "GOOGLE" in upper_value:
+                return "gcp"
+            return value.lower()
+    if os.environ.get("AWS_EXECUTION_ENV") or os.environ.get("AWS_REGION"):
+        return "aws"
+    if os.environ.get("GOOGLE_CLOUD_PROJECT") or os.environ.get("K_SERVICE"):
+        return "gcp"
+    if os.environ.get("AZURE_REGION"):
+        return "azure"
+    return None
+
+
+def _modal_placement_payload() -> dict[str, Any]:
+    return {
+        "configured_regions": FUNCTION_REGIONS,
+        "runtime_region": _detect_runtime_region() or "unknown",
+        "cloud_provider": _detect_cloud_provider() or "unknown",
+    }
+
+
+def _log_modal_placement_once() -> None:
+    global _placement_logged
+    if _placement_logged:
         return
-    try:
-        _start_clickhouse_server()
-        if _clickhouse_client is None:
-            raise RuntimeError("ClickHouse startup did not initialize an HTTP client")
-        _clickhouse_startup_error = None
-    except Exception as exc:  # noqa: BLE001
-        _clickhouse_startup_error = str(exc)
-        raise
+    placement = _modal_placement_payload()
+    payload = json.dumps(placement, sort_keys=True)
+    print(f"modal_placement {payload}", flush=True)
+    _placement_logged = True
 
 
-def _stop_clickhouse_server() -> None:
-    global _clickhouse_process, _clickhouse_client
-    _clickhouse_client = None
-    if _clickhouse_process is None:
-        return
-    if _clickhouse_process.poll() is None:
-        _clickhouse_process.terminate()
-        try:
-            _clickhouse_process.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            _clickhouse_process.kill()
-            _clickhouse_process.wait(timeout=5)
-    _clickhouse_process = None
+def _get_session() -> Session:
+    global _session
+    if _session is None:
+        with _silence_stderr():
+            _session = Session()
+            _session.query("SELECT 1")
+    return _session
 
 
 READ_ONLY_QUERY_PREFIXES = ("SELECT", "WITH", "SHOW", "DESCRIBE", "DESC", "EXISTS")
@@ -184,23 +195,53 @@ def _to_jsonable(value: Any) -> Any:
     return str(value)
 
 
+def _apply_settings(session: Session, settings: dict[str, Any]) -> None:
+    for key, value in settings.items():
+        if isinstance(value, bool):
+            session.query(f"SET {key} = {1 if value else 0}")
+        elif isinstance(value, str):
+            escaped = value.replace("\\", "\\\\").replace("'", "\\'")
+            session.query(f"SET {key} = '{escaped}'")
+        else:
+            session.query(f"SET {key} = {value}")
+
+
 def _execute_query(query: str, settings: dict[str, Any] | None = None) -> dict[str, Any]:
-    _ensure_clickhouse_server()
-    if _clickhouse_client is None:
-        raise RuntimeError("ClickHouse client is not initialized")
+    session = _get_session()
+
+    if settings:
+        _apply_settings(session, settings)
 
     first_keyword = query.lstrip().split(maxsplit=1)[0].upper() if query.strip() else ""
 
     if first_keyword in READ_ONLY_QUERY_PREFIXES:
-        result = _clickhouse_client.query(query, settings=settings)
+        raw = session.query(query, "JSONCompact")
+        raw_str = str(raw).strip()
+        if not raw_str:
+            return {"columns": [], "rows": [], "rows_before_limit": None, "summary": {}}
+
+        result = json.loads(raw_str)
+        columns = [col["name"] for col in result.get("meta", [])]
+        rows = result.get("data", [])
+        statistics = result.get("statistics", {})
+
+        summary: dict[str, Any] = {}
+        if statistics:
+            if "elapsed" in statistics:
+                summary["elapsed_ns"] = str(int(float(statistics["elapsed"]) * 1_000_000_000))
+            if "rows_read" in statistics:
+                summary["rows_read"] = str(statistics["rows_read"])
+            if "bytes_read" in statistics:
+                summary["bytes_read"] = str(statistics["bytes_read"])
+
         return {
-            "columns": result.column_names,
-            "rows": _to_jsonable(result.result_rows),
-            "rows_before_limit": _to_jsonable(result.summary.get("rows_before_limit_at_least")),
-            "summary": _to_jsonable(result.summary),
+            "columns": columns,
+            "rows": _to_jsonable(rows),
+            "rows_before_limit": result.get("rows_before_limit_at_least"),
+            "summary": _to_jsonable(summary),
         }
 
-    _clickhouse_client.command(query, settings=settings)
+    session.query(query)
     return {"columns": [], "rows": [], "summary": {}}
 
 
@@ -260,38 +301,25 @@ def _make_asgi_app() -> FastAPI:
 
     @api.on_event("startup")
     async def _startup() -> None:
-        try:
-            _ensure_clickhouse_server()
-        except Exception:
-            # Keep ASGI app alive so diagnostics can be queried via /healthz or websocket.
-            pass
+        _install_asyncio_exception_filter()
+        _log_modal_placement_once()
+        _get_session()
 
     @api.on_event("shutdown")
     async def _shutdown() -> None:
-        _stop_clickhouse_server()
+        global _session
+        if _session is not None:
+            _session.cleanup()
+            _session = None
 
     @api.get("/healthz")
     async def healthz() -> dict[str, Any]:
         try:
-            _ensure_clickhouse_server()
-            if _clickhouse_client is None:
-                raise RuntimeError("ClickHouse client is not initialized after startup")
-            _clickhouse_client.query("SELECT 1")
-            return {
-                "ok": True,
-                "startup_error": None,
-                "async_load_databases_config": CLICKHOUSE_ASYNC_CONFIG_PATH,
-                "server_log_path": str(CLICKHOUSE_LOG_PATH),
-                "server_err_log_path": str(CLICKHOUSE_ERR_LOG_PATH),
-            }
+            session = _get_session()
+            session.query("SELECT 1")
+            return {"ok": True, "engine": "chdb"}
         except Exception as exc:  # noqa: BLE001
-            return {
-                "ok": False,
-                "startup_error": str(exc),
-                "async_load_databases_config": CLICKHOUSE_ASYNC_CONFIG_PATH,
-                "server_log_path": str(CLICKHOUSE_LOG_PATH),
-                "server_err_log_path": str(CLICKHOUSE_ERR_LOG_PATH),
-            }
+            return {"ok": False, "error": str(exc), "engine": "chdb"}
 
     @api.websocket("/ws")
     async def websocket_query_endpoint(websocket: WebSocket) -> None:
@@ -300,10 +328,16 @@ def _make_asgi_app() -> FastAPI:
             while True:
                 raw_message = await websocket.receive_text()
                 request_id, query_items, was_batch, parse_error = _parse_query_items(raw_message)
+                placement = _modal_placement_payload()
 
                 if parse_error:
                     await websocket.send_json(
-                        {"id": request_id, "ok": False, "error": parse_error}
+                        {
+                            "id": request_id,
+                            "ok": False,
+                            "error": parse_error,
+                            "modal_placement": placement,
+                        }
                     )
                     continue
 
@@ -312,7 +346,13 @@ def _make_asgi_app() -> FastAPI:
                     try:
                         result = _execute_query(query_text, settings=query_settings)
                         await websocket.send_json(
-                            {"id": request_id, "ok": True, "query": query_text, **result}
+                            {
+                                "id": request_id,
+                                "ok": True,
+                                "query": query_text,
+                                "modal_placement": placement,
+                                **result,
+                            }
                         )
                     except Exception as exc:  # noqa: BLE001
                         await websocket.send_json(
@@ -321,6 +361,7 @@ def _make_asgi_app() -> FastAPI:
                                 "ok": False,
                                 "query": query_text,
                                 "error": str(exc),
+                                "modal_placement": placement,
                             }
                         )
                     continue
@@ -342,6 +383,7 @@ def _make_asgi_app() -> FastAPI:
                         "id": request_id,
                         "ok": all_ok,
                         "results": result_items,
+                        "modal_placement": placement,
                     }
                 )
         except WebSocketDisconnect:
